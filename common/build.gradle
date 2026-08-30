@@ -1,0 +1,351 @@
+architectury {
+    common rootProject.enabled_platforms.split(',')
+}
+
+def generatedResources = layout.buildDirectory.dir('generated/resources/main')
+def buildingBlockManifest = layout.buildDirectory.file('generated/building-blocks.txt')
+def minecraftAssetsJar = new File(
+        gradle.gradleUserHomeDir,
+        "caches/fabric-loom/minecraftMaven/net/minecraft/minecraft-merged-deobf/${rootProject.minecraft_version}/minecraft-merged-deobf-${rootProject.minecraft_version}.jar")
+sourceSets.main.resources.srcDir(generatedResources)
+
+tasks.register('generateBuildingBlockManifest', org.gradle.api.tasks.JavaExec) {
+    dependsOn tasks.named('compileJava')
+    classpath = files(sourceSets.main.output.classesDirs, configurations.runtimeClasspath)
+    mainClass = 'com.missingpieces.data.BuildingBlockManifest'
+    args(buildingBlockManifest.get().asFile.absolutePath)
+    javaLauncher = javaToolchains.launcherFor {
+        languageVersion = JavaLanguageVersion.of(25)
+    }
+    outputs.file(buildingBlockManifest)
+}
+
+tasks.register('generateVariantAssets') {
+    dependsOn tasks.named('generateBuildingBlockManifest')
+    inputs.file(minecraftAssetsJar)
+    inputs.file(buildingBlockManifest)
+    outputs.dir(generatedResources)
+
+    doLast {
+        def outputDir = generatedResources.get().asFile
+        delete(outputDir)
+        outputDir.mkdirs()
+
+        if (!minecraftAssetsJar.isFile()) {
+            throw new GradleException("Minecraft assets are unavailable at ${minecraftAssetsJar}; run a Loom task once to download them.")
+        }
+        def minecraftJar = minecraftAssetsJar
+        def zip = new java.util.zip.ZipFile(minecraftJar)
+        def jsonParser = new groovy.json.JsonSlurper()
+        def modelCache = [:]
+        def allBlockIds = new LinkedHashSet<>(buildingBlockManifest.get().asFile.readLines().findAll { !it.isBlank() })
+        def vanillaBlockIds = [] as Set
+        zip.entries().each { entry ->
+            if (!entry.isDirectory() && entry.name.startsWith('assets/minecraft/blockstates/') && entry.name.endsWith('.json')) {
+                vanillaBlockIds << entry.name.substring('assets/minecraft/blockstates/'.length(), entry.name.length() - '.json'.length())
+            }
+        }
+
+        def suffixes = ['stairs', 'slab', 'wall', 'fence', 'button', 'pressure_plate']
+        def woods = ['oak', 'spruce', 'birch', 'jungle', 'acacia', 'cherry', 'dark_oak', 'pale_oak', 'mangrove', 'bamboo', 'crimson', 'warped']
+        def minerals = ['coal', 'copper', 'iron', 'gold', 'diamond', 'emerald', 'lapis', 'redstone', 'netherite', 'amethyst', 'quartz', 'raw_iron', 'raw_copper', 'raw_gold']
+
+        def vanillaVariantExists = { String baseId, String suffix ->
+            def roots = [baseId]
+            if (baseId.endsWith('s')) roots << baseId.substring(0, baseId.length() - 1)
+            if (baseId.endsWith('_block')) roots << baseId.substring(0, baseId.length() - '_block'.length())
+            roots.any { vanillaBlockIds.contains(it + '_' + suffix) }
+        }
+
+        def excluded = { String id ->
+            if (id == 'air' || id == 'reinforced_deepslate') return true
+            if (suffixes.any { id.endsWith('_' + it) }) return true
+            if (woods.any { id == it || id.startsWith(it + '_') || id.contains('_' + it + '_') }) return true
+            if (id.contains('_log') || id.endsWith('_wood') || id.contains('_hyphae') || id.contains('_stem') || id.contains('_leaves') || id.contains('_planks')) return true
+            if (id.endsWith('_trapdoor') || id.endsWith('_door') || id.endsWith('_bars') || id.endsWith('_chain')) return true
+            if (id.contains('copper')) return true
+            return minerals.any { id.contains(it) } && (id.endsWith('_block') || id.endsWith('_ore') || id.startsWith('raw_'))
+        }
+
+        def readJson = { String path ->
+            def entry = zip.getEntry(path)
+            entry == null ? null : jsonParser.parseText(zip.getInputStream(entry).getText('UTF-8'))
+        }
+
+        def modelTextures
+        modelTextures = { String modelId, Set<String> visiting = [] as Set ->
+            if (modelCache.containsKey(modelId)) return modelCache[modelId]
+            if (!visiting.add(modelId)) return [:]
+            def separator = modelId.indexOf(':')
+            def namespace = separator >= 0 ? modelId.substring(0, separator) : 'minecraft'
+            def path = separator >= 0 ? modelId.substring(separator + 1) : modelId
+            def json = readJson('assets/' + namespace + '/models/' + path + '.json')
+            def textures = [:]
+            if (json?.parent) textures.putAll(modelTextures(json.parent as String, visiting))
+            if (json?.textures instanceof Map) textures.putAll(json.textures.collectEntries { k, v -> [(k.toString()): v.toString()] })
+            visiting.remove(modelId)
+            def resolved = textures.collectEntries { key, value ->
+                def current = value
+                def seen = [] as Set
+                while (current.startsWith('#') && seen.add(current)) current = textures[current.substring(1)] ?: current
+                [(key): current]
+            }
+            modelCache[modelId] = resolved
+            return resolved
+        }
+
+        def firstModel
+        firstModel = { value ->
+            if (value instanceof Map) {
+                if (value.model) return value.model.toString()
+                for (def child : value.values()) {
+                    def found = firstModel(child)
+                    if (found) return found
+                }
+            } else if (value instanceof List) {
+                for (def child : value) {
+                    def found = firstModel(child)
+                    if (found) return found
+                }
+            }
+            return null
+        }
+
+        def sourceTextures = { String id ->
+            def blockState = readJson('assets/minecraft/blockstates/' + id + '.json')
+            def sourceModel = firstModel(blockState) ?: 'minecraft:block/' + id
+            def textures = modelTextures(sourceModel)
+            def fallback = 'minecraft:block/' + id
+            def side = textures.side ?: textures.all ?: textures.texture ?: textures.end ?: textures.top ?: fallback
+            def top = textures.top ?: textures.end ?: textures.all ?: side
+            def bottom = textures.bottom ?: textures.end ?: textures.all ?: top
+            def single = textures.all ?: textures.texture ?: textures.side ?: side
+            [side: side, top: top, bottom: bottom, texture: single]
+        }
+
+        def writeJson = { String relative, Object value ->
+            def file = new File(outputDir, relative)
+            file.parentFile.mkdirs()
+            file.text = groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(value)) + System.lineSeparator()
+        }
+
+        def blockModel = { String id, String type, Map textures ->
+            def map = [parent: 'minecraft:block/' + type]
+            if (type in ['stairs', 'slab']) map.textures = [bottom: textures.bottom, side: textures.side, top: textures.top]
+            if (type == 'button') map.textures = [texture: textures.texture]
+            if (type == 'pressure_plate_up') map.textures = [texture: textures.texture]
+            if (type == 'template_wall_post' || type == 'template_wall_side' || type == 'template_wall_side_tall') map.textures = [wall: textures.side]
+            if (type == 'fence_post' || type == 'fence_side') map.textures = [texture: textures.texture]
+            writeJson('assets/missing_pieces/models/block/' + id + '.json', map)
+        }
+
+        def writeItem = { String id, String model ->
+            writeJson('assets/missing_pieces/items/' + id + '.json', [
+                    model: [type: 'minecraft:model', model: model]
+            ])
+        }
+
+        def makeStairsState = { String id ->
+            def state = readJson('assets/minecraft/blockstates/stone_stairs.json')
+            state.variants.values().each { variant ->
+                def suffix = variant.model.endsWith('_inner') ? '_inner' : variant.model.endsWith('_outer') ? '_outer' : ''
+                variant.model = 'missing_pieces:block/' + id + suffix
+            }
+            writeJson('assets/missing_pieces/blockstates/' + id + '.json', state)
+            def baseId = id.substring(0, id.length() - '_stairs'.length())
+            def textures = sourceTextures(baseId)
+            ['inner', 'outer'].each { shape ->
+                writeJson('assets/missing_pieces/models/block/' + id + '_' + shape + '.json', [
+                        parent: 'minecraft:block/' + shape + '_stairs',
+                        textures: [bottom: textures.bottom, side: textures.side, top: textures.top]
+                ])
+            }
+        }
+
+        def makeSlabState = { String id ->
+            writeJson('assets/missing_pieces/blockstates/' + id + '.json', [variants: [
+                    'type=bottom': [model: 'missing_pieces:block/' + id],
+                    'type=top': [model: 'missing_pieces:block/' + id + '_top'],
+                    'type=double': [model: 'minecraft:block/' + id.substring(0, id.length() - '_slab'.length())]
+            ]])
+            writeJson('assets/missing_pieces/models/block/' + id + '_top.json', [parent: 'minecraft:block/slab_top', textures: [bottom: sourceTextures(id.substring(0, id.length() - '_slab'.length())).bottom, side: sourceTextures(id.substring(0, id.length() - '_slab'.length())).side, top: sourceTextures(id.substring(0, id.length() - '_slab'.length())).top]])
+        }
+
+        def makeWallState = { String id ->
+            def base = 'missing_pieces:block/' + id
+            def multipart = [
+                    [apply: [model: base + '_post'], when: [up: 'true']],
+                    [apply: [model: base + '_side', uvlock: true], when: [north: 'low']],
+                    [apply: [model: base + '_side', uvlock: true, y: 90], when: [east: 'low']],
+                    [apply: [model: base + '_side', uvlock: true, y: 180], when: [south: 'low']],
+                    [apply: [model: base + '_side', uvlock: true, y: 270], when: [west: 'low']],
+                    [apply: [model: base + '_side_tall', uvlock: true], when: [north: 'tall']],
+                    [apply: [model: base + '_side_tall', uvlock: true, y: 90], when: [east: 'tall']],
+                    [apply: [model: base + '_side_tall', uvlock: true, y: 180], when: [south: 'tall']],
+                    [apply: [model: base + '_side_tall', uvlock: true, y: 270], when: [west: 'tall']]
+            ]
+            writeJson('assets/missing_pieces/blockstates/' + id + '.json', [multipart: multipart])
+            writeItem(id, base + '_inventory')
+            writeJson('assets/missing_pieces/models/block/' + id + '_inventory.json', [parent: 'minecraft:block/wall_inventory', textures: [wall: sourceTextures(id.substring(0, id.length() - '_wall'.length())).side]])
+        }
+
+        def makeFenceState = { String id ->
+            def base = 'missing_pieces:block/' + id
+            def multipart = [[apply: [model: base + '_post']]]
+            [['north', 0], ['east', 90], ['south', 180], ['west', 270]].each { side, rotation ->
+                multipart << [apply: [model: base + '_side', uvlock: true] + (rotation ? [y: rotation] : [:]), when: [(side): 'true']]
+            }
+            writeJson('assets/missing_pieces/blockstates/' + id + '.json', [multipart: multipart])
+            writeItem(id, base + '_inventory')
+            writeJson('assets/missing_pieces/models/block/' + id + '_inventory.json', [parent: 'minecraft:block/fence_inventory', textures: [texture: sourceTextures(id.substring(0, id.length() - '_fence'.length())).texture]])
+        }
+
+        def makeButtonState = { String id ->
+            def state = readJson('assets/minecraft/blockstates/stone_button.json')
+            state.variants.values().each { variant ->
+                variant.model = 'missing_pieces:block/' + id + (variant.model.endsWith('_pressed') ? '_pressed' : '')
+            }
+            writeJson('assets/missing_pieces/blockstates/' + id + '.json', state)
+            def textures = sourceTextures(id.substring(0, id.length() - '_button'.length()))
+            writeJson('assets/missing_pieces/models/block/' + id + '_pressed.json', [parent: 'minecraft:block/button_pressed', textures: [texture: textures.texture]])
+            writeJson('assets/missing_pieces/models/block/' + id + '_inventory.json', [parent: 'minecraft:block/button_inventory', textures: [texture: textures.texture]])
+            writeItem(id, 'missing_pieces:block/' + id + '_inventory')
+        }
+
+        def makePressureState = { String id ->
+            writeJson('assets/missing_pieces/blockstates/' + id + '.json', [variants: [
+                    'powered=false': [model: 'missing_pieces:block/' + id],
+                    'powered=true': [model: 'missing_pieces:block/' + id + '_down']
+            ]])
+            def textures = sourceTextures(id.substring(0, id.length() - '_pressure_plate'.length()))
+            writeJson('assets/missing_pieces/models/block/' + id + '_down.json', [parent: 'minecraft:block/pressure_plate_down', textures: [texture: textures.texture]])
+        }
+
+        def englishNames = readJson('assets/minecraft/lang/en_us.json') ?: [:]
+        def chineseNames = [
+                andesite: '安山岩', basalt: '玄武岩', blackstone: '黑石', bricks: '砖块',
+                chiseled_cinnabar: '雕纹辰砂', chiseled_deepslate: '雕纹深板岩',
+                chiseled_nether_bricks: '雕纹下界砖', chiseled_polished_blackstone: '雕纹磨制黑石',
+                chiseled_red_sandstone: '雕纹红砂岩', chiseled_resin_bricks: '雕纹树脂砖',
+                chiseled_sandstone: '雕纹砂岩', chiseled_stone_bricks: '雕纹石砖',
+                chiseled_sulfur: '雕纹硫磺', chiseled_tuff: '雕纹凝灰岩',
+                chiseled_tuff_bricks: '雕纹凝灰岩砖', cinnabar: '辰砂', cinnabar_bricks: '辰砂砖',
+                cobbled_deepslate: '深板岩圆石', cobblestone: '圆石',
+                cracked_deepslate_bricks: '裂纹深板岩砖', cracked_deepslate_tiles: '裂纹深板岩瓦',
+                cracked_nether_bricks: '裂纹下界砖', cracked_polished_blackstone_bricks: '裂纹磨制黑石砖',
+                cracked_stone_bricks: '裂纹石砖', cut_red_sandstone: '切制红砂岩',
+                cut_sandstone: '切制砂岩', dark_prismarine: '暗海晶石', deepslate: '深板岩',
+                deepslate_bricks: '深板岩砖', deepslate_tiles: '深板岩瓦', diorite: '闪长岩',
+                end_stone: '末地石', end_stone_bricks: '末地石砖', gilded_blackstone: '镶金黑石',
+                granite: '花岗岩', iron_door: '铁门', mossy_cobblestone: '苔石',
+                mossy_stone_bricks: '苔石砖', mud_bricks: '泥砖', nether_bricks: '下界砖',
+                netherrack: '下界岩', packed_mud: '泥坯', polished_andesite: '磨制安山岩',
+                polished_basalt: '磨制玄武岩', polished_blackstone: '磨制黑石',
+                polished_blackstone_bricks: '磨制黑石砖', polished_cinnabar: '磨制辰砂',
+                polished_deepslate: '磨制深板岩', polished_diorite: '磨制闪长岩',
+                polished_granite: '磨制花岗岩', polished_sulfur: '磨制硫磺',
+                polished_tuff: '磨制凝灰岩', prismarine: '海晶石', prismarine_bricks: '海晶石砖',
+                purpur_block: '紫珀块', purpur_pillar: '紫珀柱', quartz_bricks: '石英砖',
+                quartz_pillar: '石英柱', red_nether_bricks: '红色下界砖', red_sandstone: '红砂岩',
+                resin_bricks: '树脂砖', sandstone: '砂岩', sea_lantern: '海晶灯',
+                smooth_basalt: '平滑玄武岩', smooth_quartz: '平滑石英块',
+                smooth_red_sandstone: '平滑红砂岩', smooth_sandstone: '平滑砂岩',
+                smooth_stone: '平滑石头', stone: '石头', stone_bricks: '石砖', sulfur: '硫磺',
+                sulfur_bricks: '硫磺砖', tuff: '凝灰岩', tuff_bricks: '凝灰岩砖'
+        ]
+        def englishSuffixes = [stairs: ' Stairs', slab: ' Slab', wall: ' Wall', fence: ' Fence',
+                button: ' Button', pressure_plate: ' Pressure Plate']
+        def chineseSuffixes = [stairs: '楼梯', slab: '台阶', wall: '墙', fence: '栅栏',
+                button: '按钮', pressure_plate: '压力板']
+        def recipes = [:]
+        def loot = [:]
+        def fenceTagValues = []
+        def wallTagValues = []
+        def englishTranslations = [:]
+        def chineseTranslations = [:]
+
+        allBlockIds.findAll { !excluded(it) }.sort().each { baseId ->
+            def textures = sourceTextures(baseId)
+            suffixes.findAll { type -> !vanillaVariantExists(baseId, type) }.each { type ->
+                def id = baseId + '_' + type
+                def baseItem = 'minecraft:' + baseId
+                switch (type) {
+                    case 'stairs':
+                        blockModel(id, 'stairs', textures); makeStairsState(id)
+                        writeItem(id, 'missing_pieces:block/' + id)
+                        recipes[id] = [type: 'minecraft:crafting_shaped', category: 'building', pattern: ['B  ', 'BB ', 'BBB'], key: [B: baseItem], result: [id: 'missing_pieces:' + id, count: 4]]
+                        break
+                    case 'slab':
+                        blockModel(id, 'slab', textures); makeSlabState(id)
+                        writeItem(id, 'missing_pieces:block/' + id)
+                        recipes[id] = [type: 'minecraft:crafting_shaped', category: 'building', pattern: ['BBB'], key: [B: baseItem], result: [id: 'missing_pieces:' + id, count: 6]]
+                        break
+                    case 'wall':
+                        makeWallState(id); blockModel(id + '_post', 'template_wall_post', textures); blockModel(id + '_side', 'template_wall_side', textures); blockModel(id + '_side_tall', 'template_wall_side_tall', textures)
+                        recipes[id] = [type: 'minecraft:crafting_shaped', category: 'building', pattern: ['BBB', 'BBB'], key: [B: baseItem], result: [id: 'missing_pieces:' + id, count: 6]]
+                        break
+                    case 'fence':
+                        makeFenceState(id); blockModel(id + '_post', 'fence_post', textures); blockModel(id + '_side', 'fence_side', textures)
+                        recipes[id] = [type: 'minecraft:crafting_shaped', category: 'building', pattern: ['B#B', 'B#B'], key: [B: baseItem, '#': 'minecraft:stick'], result: [id: 'missing_pieces:' + id, count: 3]]
+                        break
+                    case 'button':
+                        blockModel(id, 'button', textures); makeButtonState(id)
+                        recipes[id] = [type: 'minecraft:crafting_shapeless', category: 'redstone', ingredients: [baseItem], result: [id: 'missing_pieces:' + id]]
+                        break
+                    case 'pressure_plate':
+                        blockModel(id, 'pressure_plate_up', textures); makePressureState(id)
+                        writeItem(id, 'missing_pieces:block/' + id)
+                        recipes[id] = [type: 'minecraft:crafting_shaped', category: 'redstone', pattern: ['BB'], key: [B: baseItem], result: [id: 'missing_pieces:' + id]]
+                        break
+                }
+                if (type == 'fence') {
+                    fenceTagValues << 'missing_pieces:' + id
+                }
+                if (type == 'wall') {
+                    wallTagValues << 'missing_pieces:' + id
+                }
+                def englishBaseName = englishNames['block.minecraft.' + baseId]
+                        ?: baseId.split('_').collect { it.capitalize() }.join(' ')
+                def chineseBaseName = chineseNames[baseId] ?: englishBaseName
+                englishTranslations['block.missing_pieces.' + id] = englishBaseName + englishSuffixes[type]
+                chineseTranslations['block.missing_pieces.' + id] = chineseBaseName + chineseSuffixes[type]
+                if (type == 'slab') {
+                    loot[id] = [type: 'minecraft:block', random_sequence: 'missing_pieces:blocks/' + id, pools: [[
+                            rolls: 1.0,
+                            entries: [[type: 'minecraft:item', name: 'missing_pieces:' + id, functions: [
+                                    [function: 'minecraft:set_count', count: 2.0, conditions: [[condition: 'minecraft:block_state_property', block: 'missing_pieces:' + id, properties: [type: 'double']]]],
+                                    [function: 'minecraft:explosion_decay']
+                            ]]]
+                    ]]]
+                } else {
+                    loot[id] = [type: 'minecraft:block', random_sequence: 'missing_pieces:blocks/' + id, pools: [[
+                            rolls: 1.0,
+                            entries: [[type: 'minecraft:item', name: 'missing_pieces:' + id]],
+                            conditions: [[condition: 'minecraft:survives_explosion']]
+                    ]]]
+                }
+            }
+        }
+
+        recipes.each { id, recipe -> writeJson('data/missing_pieces/recipe/' + id + '.json', recipe) }
+        loot.each { id, table -> writeJson('data/missing_pieces/loot_table/blocks/' + id + '.json', table) }
+        writeJson('data/minecraft/tags/block/fences.json', [values: fenceTagValues])
+        writeJson('data/minecraft/tags/block/walls.json', [values: wallTagValues])
+        writeJson('assets/missing_pieces/lang/en_us.json', englishTranslations)
+        writeJson('assets/missing_pieces/lang/zh_cn.json', chineseTranslations)
+        zip.close()
+    }
+}
+
+tasks.named('processResources') {
+    dependsOn tasks.named('generateVariantAssets')
+}
+
+tasks.named('sourcesJar') {
+    dependsOn tasks.named('generateVariantAssets')
+}
+
+dependencies {
+    implementation "net.fabricmc:fabric-loader:$rootProject.fabric_loader_version"
+    implementation "dev.architectury:architectury:$rootProject.architectury_api_version"
+}

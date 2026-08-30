@@ -1,0 +1,35 @@
+modLoader = "javafml"
+loaderVersion = "[1,)"
+#issueTrackerURL = ""
+license = "AGPL-3.0-only"
+
+[[mods]]
+modId = "missing_pieces"
+version = "${version}"
+displayName = "Missing Pieces"
+authors = "LuLu-ling"
+description = '''
+Adds missing stairs, slabs, walls, fences, buttons, and pressure plates for vanilla building blocks.
+'''
+#logoFile = ""
+
+[[dependencies.missing_pieces]]
+modId = "neoforge"
+type = "required"
+versionRange = "[26.2.0,)"
+ordering = "NONE"
+side = "BOTH"
+
+[[dependencies.missing_pieces]]
+modId = "minecraft"
+type = "required"
+versionRange = "[26.2,)"
+ordering = "NONE"
+side = "BOTH"
+
+[[dependencies.missing_pieces]]
+modId = "architectury"
+type = "required"
+versionRange = "[21.0.7,)"
+ordering = "AFTER"
+side = "BOTH"

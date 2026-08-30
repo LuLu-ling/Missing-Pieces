@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "id": "missing_pieces",
+  "version": "${version}",
+  "name": "Missing Pieces",
+  "description": "Adds missing stairs, slabs, walls, fences, buttons, and pressure plates for vanilla building blocks.",
+  "authors": [
+    "LuLu-ling"
+  ],
+  "license": "AGPL-3.0-only",
+  "environment": "*",
+  "entrypoints": {
+    "main": [
+      "com.missingpieces.fabric.MissingPiecesFabric"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=0.19.5",
+    "minecraft": "26.2",
+    "java": ">=25",
+    "architectury": ">=21.0.7",
+    "fabric-api": "*"
+  }
+}
